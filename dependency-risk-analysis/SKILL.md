@@ -104,7 +104,7 @@ python3 <skill_dir>/scripts/find_usage.py analysis.json --src <repo_dir> [--govu
 
 `decision = Cần xác minh` chỉ khi chưa đủ căn cứ về applicability (vendor đang điều tra) hoặc thư viện không có CVE và Uzomuzo không đánh giá được. Uzomuzo `review` **không** chặn quyết định xử lý một CVE đã xác nhận. Mức ưu tiên không phải SLA - không tự đặt deadline.
 
-## Bước 4 - Phân tích sâu cho P1-P2
+## Bước 4 - Phân tích sâu (P1-P2 đầy đủ, P3 rút gọn)
 
 Dùng `references/upgrade-playbook.md`:
 - **Cách xử lý:** nâng direct, nâng thư viện cha (transitive), ép version (overrides/resolutions/dependencyManagement...), rebuild/nâng base image (gói OS), chuyển nhánh còn hỗ trợ, thay thế (ngừng bảo trì), hoặc giảm thiểu khi chưa có bản vá.
@@ -114,11 +114,16 @@ Dùng `references/upgrade-playbook.md`:
 
 ## Bước 5 - Viết báo cáo
 
-Theo đúng `references/report-template.md` (phụ lục cuối file chỉ rõ lấy từng trường từ đâu trong `analysis.json`): **header + trạng thái báo cáo + artifact identity + độ phủ dữ liệu** → **1. Tổng quan** (mỗi thư viện một hàng, có cột Phạm vi) → **2. Chi tiết CVE** → **3. Chi tiết EOL** → **4. Cần xác minh** (chỉ khi có), rồi chạy checklist cuối template. Lưu thành `dependency-analysis-report.md`, hoặc trả trực tiếp trong chat nếu người dùng không cần file.
+Theo đúng `references/report-template.md` (phụ lục cuối file chỉ rõ lấy từng trường từ đâu trong `analysis.json`):
+
+1. **Tổng quan** - 1.1 bảng kết quả quét theo từng file input (`meta.input_files`); 1.2 bảng kết luận tổng quan (trạng thái báo cáo, artifact, số lượng lỗi, theo ưu tiên/quyết định/nhóm, độ phủ, tối đa 3 cảnh báo, việc cần làm ngay).
+2. **Danh sách lỗi** - mỗi nhóm lỗi một hàng, mã `C<n>`/`E<n>`/`V<n>`: tên lỗi, package, **file input + vị trí phát hiện** (`found_in`), version hiện tại, version cần nâng lên, loại, mức độ, ưu tiên, phạm vi, quyết định, rủi ro nâng cấp. Sắp P1 → P4.
+3. **Phân tích chi tiết** - 3.1 CVE, 3.2 EOL; mỗi mục sắp từ ưu tiên cao xuống thấp; thẻ dùng đúng mã ở mục 2.
+4. **Cần xác minh** (chỉ khi có), rồi chạy checklist cuối template. Lưu thành `dependency-analysis-report.md`, hoặc trả trực tiếp trong chat nếu người dùng không cần file.
 
 Quy tắc ngắn gọn:
 - Viết bằng ngôn ngữ của người dùng (mặc định tiếng Việt), giữ thuật ngữ kỹ thuật tiếng Anh.
-- Thẻ chi tiết chỉ cho P1-P2, tối đa ~10 thẻ; thư viện cùng cách xử lý (cùng thư viện cha, cùng nhóm OS) gom chung một thẻ. Không bao giờ ẩn P1-P2 khỏi bảng tổng quan.
+- Thẻ chi tiết cho mọi hàng C/E có quyết định Cần xử lý: P1-P2 thẻ đầy đủ, P3 thẻ rút gọn; hàng V (cần xác minh/theo dõi) chỉ ở mục 2 và 4. Thư viện cùng cách xử lý (cùng thư viện cha, cùng nhóm OS) có thể gom một thẻ (ghi đủ các mã). Không bao giờ ẩn P1-P2 khỏi danh sách lỗi.
 - Thư viện vừa ngừng bảo trì vừa có CVE: chỉ 1 thẻ ở mục EOL.
 - Mỗi thẻ theo đúng các dòng của template, mỗi ô 1-2 câu. Tối đa 3 CVE mỗi thư viện, còn lại `+N`. Không chép mô tả CVE.
 - Cảnh báo độ phủ dữ liệu: tối đa 3 gạch đầu dòng quan trọng nhất (cái nào làm thay đổi kết luận).

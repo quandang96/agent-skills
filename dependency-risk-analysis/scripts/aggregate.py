@@ -234,6 +234,7 @@ def parse_trivy(data, ctx):
     vulns, others, info = ctx["vulns"], ctx["others"], ctx["trivy_info"]
     if isinstance(data, dict) and "Results" in data:
         info["formats"].add("native")
+        ctx.setdefault("file_format", {})[ctx.get("cur_file")] = "Trivy JSON gốc"
         md = data.get("Metadata") or {}
         info["artifacts"].append({"name": data.get("ArtifactName"), "digests": md.get("RepoDigests") or [],
                                   "image_id": md.get("ImageID"), "created": data.get("CreatedAt")})
@@ -259,15 +260,18 @@ def parse_trivy(data, ctx):
                     "purl": (v.get("PkgIdentifier") or {}).get("PURL"),
                     "fixed": split_fixed(v.get("FixedVersion")), "fixed_source": "Trivy" if v.get("FixedVersion") else None,
                     "status": (v.get("Status") or "").lower() or None, "title": (v.get("Title") or "")[:120],
-                    "target": tgt, "is_os": cls == "os-pkgs", "aliases": [],
+                    "target": tgt, "is_os": cls == "os-pkgs", "aliases": [], "src": ctx.get("cur_file"),
                     "pkg_path": v.get("PkgPath") or (tgt if cls == "lang-pkgs" else None)})
             for m in res.get("Misconfigurations") or []:
                 if (m.get("Status") or "").upper() != "PASS":
-                    others.append({"check": "misconfig", "severity": m.get("Severity"), "title": (m.get("Title") or "")[:120], "path": tgt})
+                    others.append({"check": "misconfig", "severity": m.get("Severity"), "title": (m.get("Title") or "")[:120], "path": tgt,
+                                   "src": ctx.get("cur_file")})
             for s in res.get("Secrets") or []:
-                others.append({"check": "secret", "severity": s.get("Severity"), "title": (s.get("Title") or "")[:120], "path": tgt})
+                others.append({"check": "secret", "severity": s.get("Severity"), "title": (s.get("Title") or "")[:120], "path": tgt,
+                               "src": ctx.get("cur_file")})
         return
     info["formats"].add("codequality")
+    ctx.setdefault("file_format", {})[ctx.get("cur_file")] = "Trivy code-quality"
     for it in data or []:
         desc = it.get("description") or ""
         content = it.get("content") or ""
@@ -280,7 +284,7 @@ def parse_trivy(data, ctx):
         path = (it.get("location") or {}).get("path", "")
         m = VULN_ID_RE.search(desc) or VULN_ID_RE.search(content)
         if not m:
-            others.append({"check": it.get("check_name"), "severity": sev, "title": desc[:160], "path": path,
+            others.append({"check": it.get("check_name"), "severity": sev, "title": desc[:160], "path": path, "src": ctx.get("cur_file"),
                            "advisory_without_id": it.get("check_name") in ("container_scanning", "dependency_scanning")})
             continue
         if OS_TARGET_RE.search(path):
@@ -295,7 +299,7 @@ def parse_trivy(data, ctx):
         vulns.append({"id": canon_id(m.group(1)), "severity": sev, "pkg": pkg, "installed": inst, "purl": None,
                       "fixed": split_fixed(fixed), "fixed_source": "Trivy" if fixed else None,
                       "status": status.lower().replace(" ", "_") if status else None, "title": (title or "")[:120],
-                      "target": path, "is_os": bool(OS_TARGET_RE.search(path)), "aliases": [],
+                      "target": path, "is_os": bool(OS_TARGET_RE.search(path)), "aliases": [], "src": ctx.get("cur_file"),
                       "pkg_path": None if OS_TARGET_RE.search(path) else path})
 
 
@@ -337,9 +341,9 @@ def parse_sbom(doc, root_names=()):
         elif t == "CONTAINED_BY":
             contains[b].append(a)
             contained_by[a].add(b)
-    roots = {s for s, n in nodes.items() if n["purpose"] in ROOT_PURPOSES or s.startswith("SPDXRef-Application")
-             or (n["name"] or "").lower() in root_names}
-    project_root_ids = {s for s, n in nodes.items() if (n["name"] or "").lower() in root_names}
+    project_root_ids = {s for s, n in nodes.items() if (n["name"] or "").lower() in root_names
+                        and n["purpose"] not in ("CONTAINER", "OPERATING-SYSTEM")}
+    roots = {s for s, n in nodes.items() if n["purpose"] in ROOT_PURPOSES or s.startswith("SPDXRef-Application")} | project_root_ids
     in_graph = set(dep_parents) | set(dep_children)
     app_has_graph = {r: (r in in_graph) or any(c in in_graph for c in contains.get(r, [])) for r in roots}
     g = {"nodes": nodes, "by_purl": by_purl, "by_name": by_name, "dep_parents": dep_parents, "dep_children": dep_children,
@@ -875,7 +879,11 @@ def _main(argv, osv_query_fn):
     ctx = {"vulns": [], "others": [], "trivy_pkgs": {}, "trivy_roots": set(),
            "trivy_info": {"formats": set(), "artifacts": [], "os": None}}
     for t in a.trivy:
+        ctx["cur_file"] = os.path.basename(t)
         parse_trivy(load(t), ctx)
+    uz_file = os.path.basename(a.uzomuzo) if a.uzomuzo else None
+    sb_file = os.path.basename(a.sbom) if a.sbom else None
+    uz_match = {"exact": 0, "by_name": 0, "not_in_sbom": 0, "root": 0}
     uz = load(a.uzomuzo) if a.uzomuzo else {}
     proj = M.project_roots(a.project)
     root_src = {r["name"].lower(): f"{r['manifest']}" + (" (private)" if r.get("private") else "") for r in proj}
@@ -910,6 +918,7 @@ def _main(argv, osv_query_fn):
             continue
         if pp["display"].lower() in root_names:
             root_hits.append({"name": pp["display"], "source": "Uzomuzo", "reason": root_src[pp["display"].lower()]})
+            uz_match["root"] += 1
             continue
         info = {k: p.get(k) for k in (
             "verdict", "lifecycle", "build_integrity", "archived", "disabled", "overall_score", "stable_version",
@@ -923,9 +932,14 @@ def _main(argv, osv_query_fn):
                 f = upsert(ak, n["name"], n["version"], n["eco"], n["purl"])
                 f["uzomuzo"] = dict(info)
                 f["uzomuzo_version"] = pp["version"]
+                f.setdefault("found_in", {}).setdefault(uz_file, set()).add(f"packages[] {p['purl']} (ghép theo tên)")
+            uz_match["by_name"] += 1
             continue
         f = upsert(key, pp["display"], pp["version"], pp["type"], p["purl"])
         f["uzomuzo"] = info
+        f.setdefault("found_in", {}).setdefault(uz_file, set()).add(f"packages[] {p['purl']}")
+        if g:
+            uz_match["exact" if key in g["by_purl"] else "not_in_sbom"] += 1
 
     # 2) Trivy
     n_vuln_records = 0
@@ -958,14 +972,18 @@ def _main(argv, osv_query_fn):
             f["is_os_hint"] = True
         ex = next((x for x in f["vulns"] if x["id"] == v["id"]), None)
         if not ex:
-            f["vulns"].append({k: v[k] for k in ("id", "severity", "title", "fixed", "fixed_source", "status", "aliases")})
+            f["vulns"].append({**{k: v[k] for k in ("id", "severity", "title", "fixed", "fixed_source", "status", "aliases")},
+                               "sources": [v["src"]]})
         else:  # cùng CVE từ nguồn khác: bổ sung thông tin còn thiếu
             if v["fixed"] and not ex["fixed"]:
                 ex["fixed"], ex["fixed_source"] = v["fixed"], v["fixed_source"]
             ex["status"] = ex["status"] or v["status"]
+            if v["src"] not in ex.setdefault("sources", []):
+                ex["sources"].append(v["src"])
             if SEV_ORDER.get(v["severity"], 0) > SEV_ORDER.get(ex["severity"], 0):
                 ex["severity"] = v["severity"]
         f["trivy_targets"].add(v["target"])
+        f.setdefault("found_in", {}).setdefault(v["src"], set()).add(v.get("pkg_path") or v["target"] or "-")
         loc = classify_location(v.get("pkg_path"))
         f.setdefault("vuln_locs", defaultdict(set))[v["id"]].add(loc)
         if v.get("pkg_path") and loc:
@@ -1035,6 +1053,16 @@ def _main(argv, osv_query_fn):
     for f in findings.values():
         f.pop("vuln_locs", None)
         f.pop("loc_paths", None)
+        fi = f.setdefault("found_in", {})
+        if f.get("install_location"):
+            for fn in list(fi):
+                if fn not in (uz_file, sb_file):
+                    keep = {x for x in fi[fn] if classify_location(x) in (None, f["install_location"])}
+                    fi[fn] = keep or fi[fn]
+        if f.get("sbom") and sb_file:
+            sb = f["sbom"]
+            fi[sb_file] = {f.get("install_path") or ", ".join(sb.get("locations") or []) or
+                           ("gói hệ điều hành" if f.get("ecosystem") in OS_TYPES else "có trong SBOM")}
 
     # 4) Quan hệ direct/transitive: SBOM tường minh > Trivy > Uzomuzo > SBOM suy luận; mâu thuẫn thì ghi lại
     for f in findings.values():
@@ -1285,6 +1313,51 @@ def _main(argv, osv_query_fn):
                   "no_findings": no_findings, "no_findings_basis": f"{len(fully)} package có đủ dữ liệu lỗ hổng + vòng đời",
                   "suppressed_cves": sum(len(s["ids"]) for s in suppressed), "counting": counting},
         "findings": flagged, "os_groups": os_groups, "suppressed": suppressed, "other_issues": ctx["others"]}
+    for f in out:
+        f["found_in"] = [{"file": fn, "locations": sorted(locs)[:5]} for fn, locs in sorted((f.get("found_in") or {}).items(), key=lambda x: str(x[0]))]
+
+    # Số liệu quét theo từng file input
+    input_files = []
+    for t in a.trivy:
+        fn = os.path.basename(t)
+        recs = [v for v in ctx["vulns"] if v.get("src") == fn]
+        oth = [o for o in ctx["others"] if o.get("src") == fn]
+        sevc = defaultdict(int)
+        for v in recs:
+            sevc[v["severity"]] += 1
+        oc = defaultdict(int)
+        for o in oth:
+            oc[o["check"]] += 1
+        input_files.append({
+            "file": fn, "kind": ctx.get("file_format", {}).get(fn, "Trivy"),
+            "records": len(recs), "distinct_ids": len({v["id"] for v in recs}),
+            "packages": len({(v["pkg"], v["installed"]) for v in recs if v["pkg"]}),
+            "by_severity": dict(sevc), "with_fixed_version": sum(1 for v in recs if v["fixed"]),
+            "with_status": sum(1 for v in recs if v.get("status")), "other_issues": dict(oc),
+            "targets": sorted({v["target"] for v in recs if v["target"]})[:5],
+            "flagged": sum(1 for f in flagged if any(x["file"] == fn for x in f["found_in"]))})
+    if a.uzomuzo:
+        vc = defaultdict(int)
+        for p_ in uz.get("packages", []):
+            vc[p_.get("verdict") or "-"] += 1
+        input_files.append({"file": uz_file, "kind": "Uzomuzo", "entries": len(uz.get("packages", [])), "by_verdict": dict(vc),
+                            "summary": uz.get("summary"), "sbom_match": uz_match if g else None,
+                            "flagged": sum(1 for f in flagged if any(x["file"] == uz_file for x in f["found_in"]))})
+    if g:
+        pc = defaultdict(int)
+        for n in g["nodes"].values():
+            pc[n["purpose"] or "-"] += 1
+        input_files.append({"file": sb_file, "kind": f"SBOM {g['doc'].get('spdxVersion', 'SPDX')}", "artifact": sb_name, "digest": sb_digest,
+                            "created": (g["doc"].get("creationInfo") or {}).get("created"), "packages_total": len(g["nodes"]),
+                            "app_packages": len(app_universe), "os_packages": sum(1 for k in universe if k.split("/")[0] in OS_TYPES),
+                            "by_purpose": dict(pc), "relationships": len(g["doc"].get("relationships", [])),
+                            "dependency_edges": sum(len(v) for v in g["dep_children"].values()),
+                            "project_roots_excluded": len(g["project_root_ids"]),
+                            "flagged": sum(1 for f in flagged if any(x["file"] == sb_file for x in f["found_in"]))})
+    for flag, kind, data_ in (("kev", "CISA KEV", ctx["kev"]), ("epss", "EPSS", ctx["epss"])):
+        if getattr(a, flag):
+            input_files.append({"file": os.path.basename(getattr(a, flag)), "kind": kind, "entries": len(data_ or {})})
+    result["meta"]["input_files"] = input_files
     with open(a.output, "w", encoding="utf-8") as fh:
         json.dump(result, fh, ensure_ascii=False, indent=1, default=list)
 
@@ -1300,6 +1373,9 @@ def _main(argv, osv_query_fn):
     print(f"Ưu tiên (hàng bảng): {st['rows_by_priority']} | Quyết định: {st['by_decision']} | "
           f"không phát hiện vấn đề: {f'{no_findings}/{len(fully)} package đủ dữ liệu' if no_findings is not None else 'không kết luận (thiếu nguồn)'} | "
           f"CVE không áp dụng (vendor): {st['suppressed_cves']}")
+    for x in result["meta"]["input_files"]:
+        extra = {k: v for k, v in x.items() if k not in ("file", "kind", "targets", "summary")}
+        print(f"[File] {x['file']} ({x['kind']}): {json.dumps(extra, ensure_ascii=False, default=str)}")
     c = st["counting"]
     print(f"Đếm: {c['scanner_records']} record · {c['distinct_ids']} ID · unique sau chuẩn hoá alias: "
           f"{c['unique_vulnerabilities'] if c['unique_vulnerabilities'] is not None else 'chưa xác định'} · "
